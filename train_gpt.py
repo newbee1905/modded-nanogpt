@@ -1854,7 +1854,8 @@ class GPT(nn.Module):
                 target_seq, 
                 reduction='none'
             )
-            losses = losses * mtp_weights.view(-1)
+						if mtp_weights is not None:
+							losses = losses * mtp_weights.view(-1)
 
             loss = losses.sum()
         else:
