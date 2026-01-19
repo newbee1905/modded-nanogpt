@@ -961,6 +961,9 @@ class HyperballNorm(torch.autograd.Function):
         return grad_input
 
 def norm(x: torch.Tensor):
+    if not x.is_contiguous():
+        x = x.contiguous()
+
     input_shape = x.shape
     x_flat = x.view(-1, input_shape[-1])
     
