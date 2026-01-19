@@ -911,50 +911,136 @@ class DistAdam(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the model
 
 @triton.jit
-def _hyperball_norm_kernel(
-    X_ptr, Y_ptr,
-    stride_row,
+def hyperball_norm_fwd_kernel(
+    x_ptr, y_ptr,
+    stride_x_row, stride_x_col,
+    stride_y_row, stride_y_col,
+    n_rows, n_cols,
     D,
     BLOCK_SIZE: tl.constexpr
 ):
-    row_idx = tl.program_id(0)
-    row_start_ptr = X_ptr + row_idx * stride_row
+    row_idx = tl.program_id(0).to(tl.int64)
     
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < D
+    x_row_ptr = x_ptr + row_idx * stride_x_row
+    y_row_ptr = y_ptr + row_idx * stride_y_row
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
     
-    x = tl.load(row_start_ptr + offsets, mask=mask, other=0.0)
-    x_f32 = x.to(tl.float32)
-    
-    sq = x_f32 * x_f32
+    x = tl.load(x_row_ptr + cols * stride_x_col, mask=mask, other=0.0).to(tl.float32)
+
+    # Math: scale = rsqrt(1 + mean(x^2))
+    sq = x * x
     sum_sq = tl.sum(sq, axis=0)
     mean_sq = sum_sq / D
-    
     scale = tl.rsqrt(1.0 + mean_sq)
+
+    y = x * scale
+
+    tl.store(y_row_ptr + cols * stride_y_col, y, mask=mask)
+
+@triton.jit
+def hyperball_norm_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, x_ptr,
+    stride_grad_input_row, stride_grad_input_col,
+    stride_grad_output_row, stride_grad_output_col,
+    stride_x_row, stride_x_col,
+    n_rows, n_cols,
+    D,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+
+    x_row_ptr = x_ptr + row_idx * stride_x_row
+    grad_output_row_ptr = grad_output_ptr + row_idx * stride_grad_output_row
+    grad_input_row_ptr = grad_input_ptr + row_idx * stride_grad_input_row
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+
+    x = tl.load(x_row_ptr + cols * stride_x_col, mask=mask, other=0.0).to(tl.float32)
+    dy = tl.load(grad_output_row_ptr + cols * stride_grad_output_col, mask=mask, other=0.0).to(tl.float32)
+
+    # Recompute Scale (Gradient Checkpointing logic for speed)
+    sq = x * x
+    sum_sq = tl.sum(sq, axis=0)
+    mean_sq = sum_sq / D
+    scale = tl.rsqrt(1.0 + mean_sq)
+
+    # Gradient Math: dx = scale * dy - (scale^3 * sum(x*dy)/D) * x
+    # 1. Compute projection: sum(x * dy)
+    x_dot_dy = tl.sum(x * dy, axis=0)
     
-    y = x_f32 * scale
-    y_start_ptr = Y_ptr + row_idx * stride_row
-    tl.store(y_start_ptr + offsets, y, mask=mask)
+    # Compute prefactor: (scale^3 / D) * x_dot_dy
+    prefactor = (scale * scale * scale) * (x_dot_dy / D)
+    dx = (scale * dy) - (prefactor * x)
+
+    tl.store(grad_input_row_ptr + cols * stride_grad_input_col, dx, mask=mask)
+
+class HyperballNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        n_rows, n_cols = x.shape
+        x = x.contiguous()
+        
+        y = torch.empty_like(x)
+
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+        num_warps = 4
+        if BLOCK_SIZE >= 2048: num_warps = 8
+        if BLOCK_SIZE >= 4096: num_warps = 16
+        if BLOCK_SIZE >= 8192: num_warps = 32
+
+        grid = (n_rows,)
+        
+        hyperball_norm_fwd_kernel[grid](
+            x, y,
+            x.stride(0), x.stride(1),
+            y.stride(0), y.stride(1),
+            n_rows, n_cols,
+            n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+            num_stages=4
+        )
+
+        ctx.save_for_backward(x)
+        ctx.BLOCK_SIZE = BLOCK_SIZE
+        ctx.num_warps = num_warps
+        
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, = ctx.saved_tensors
+        n_rows, n_cols = x.shape
+        
+        grad_input = torch.empty_like(x)
+        grad_output = grad_output.contiguous()
+        
+        grid = (n_rows,)
+        
+        hyperball_norm_bwd_kernel[grid](
+            grad_input, grad_output, x,
+            grad_input.stride(0), grad_input.stride(1),
+            grad_output.stride(0), grad_output.stride(1),
+            x.stride(0), x.stride(1),
+            n_rows, n_cols,
+            n_cols,
+            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            num_warps=ctx.num_warps,
+            num_stages=4
+        )
+        
+        return grad_input
 
 def norm(x: torch.Tensor):
-    if not x.is_contiguous():
-        x = x.contiguous()
-
     input_shape = x.shape
     x_flat = x.view(-1, input_shape[-1])
-    n_rows, n_cols = x_flat.shape
-    y = torch.empty_like(x_flat)
     
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    grid = (n_rows,)
+    y_flat = HyperballNorm.apply(x_flat)
     
-    _hyperball_norm_kernel[grid](
-        x_flat, y,
-        x_flat.stride(0),
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    return y.view(input_shape)
+    return y_flat.view(input_shape)
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
