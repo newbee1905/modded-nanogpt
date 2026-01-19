@@ -1124,8 +1124,8 @@ class CausalSelfAttention(nn.Module):
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        # q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = hyperball_norm(q), hyperball_norm(k) # QK norm @Grad62304977
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        # q, k = hyperball_norm(q), hyperball_norm(k) # QK norm @Grad62304977
         q, k = yarn.rotary(q), yarn.rotary(k)
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
