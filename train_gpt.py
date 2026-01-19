@@ -919,6 +919,181 @@ def norm(x: Tensor):
 
 		return x * scale
 
+@triton.jit
+def hyperball_norm_fwd_kernel(
+    x_ptr, y_ptr, scale_ptr,  # <--- Added scale_ptr
+    stride_x_batch, stride_x_seq, stride_x_head, stride_x_dim,
+    stride_y_batch, stride_y_seq, stride_y_head, stride_y_dim,
+    stride_scale_batch, stride_scale_seq, stride_scale_head, # <--- Strides for scale
+    D,
+    BLOCK_SIZE: tl.constexpr
+):
+    # Map (Batch, Seq, Head) grid
+    batch_id = tl.program_id(0).to(tl.int64)
+    seq_id   = tl.program_id(1).to(tl.int64)
+    head_id  = tl.program_id(2).to(tl.int64)
+
+    # Calculate offsets
+    x_offset = (batch_id * stride_x_batch) + (seq_id * stride_x_seq) + (head_id * stride_x_head)
+    y_offset = (batch_id * stride_y_batch) + (seq_id * stride_y_seq) + (head_id * stride_y_head)
+    scale_offset = (batch_id * stride_scale_batch) + (seq_id * stride_scale_seq) + (head_id * stride_scale_head)
+
+    # Load X
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < D
+    x = tl.load(x_ptr + x_offset + cols * stride_x_dim, mask=mask, other=0.0).to(tl.float32)
+
+    # Math: scale = rsqrt(1 + mean(x^2))
+    sq = x * x
+    mean_sq = tl.sum(sq, axis=0) / D
+    scale = tl.rsqrt(1.0 + mean_sq)
+
+    # Store Scale (Crucial for fast backward)
+    tl.store(scale_ptr + scale_offset, scale)
+
+    # Store Y
+    y = x * scale
+    tl.store(y_ptr + y_offset + cols * stride_y_dim, y, mask=mask)
+
+@triton.jit
+def hyperball_norm_bwd_kernel(
+    grad_input_ptr, grad_output_ptr, x_ptr, scale_ptr, # <--- Read scale from memory
+    stride_dx_b, stride_dx_s, stride_dx_h, stride_dx_d,
+    stride_dy_b, stride_dy_s, stride_dy_h, stride_dy_d,
+    stride_x_b,  stride_x_s,  stride_x_h,  stride_x_d,
+    stride_scale_b, stride_scale_s, stride_scale_h,
+    D,
+    BLOCK_SIZE: tl.constexpr
+):
+    batch_id = tl.program_id(0).to(tl.int64)
+    seq_id   = tl.program_id(1).to(tl.int64)
+    head_id  = tl.program_id(2).to(tl.int64)
+
+    # Calculate offsets
+    x_offset     = (batch_id * stride_x_b) + (seq_id * stride_x_s) + (head_id * stride_x_h)
+    dy_offset    = (batch_id * stride_dy_b) + (seq_id * stride_dy_s) + (head_id * stride_dy_h)
+    dx_offset    = (batch_id * stride_dx_b) + (seq_id * stride_dx_s) + (head_id * stride_dx_h)
+    scale_offset = (batch_id * stride_scale_b) + (seq_id * stride_scale_s) + (head_id * stride_scale_h)
+
+    # Load pointers
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < D
+
+    x  = tl.load(x_ptr + x_offset + cols * stride_x_d, mask=mask, other=0.0).to(tl.float32)
+    dy = tl.load(grad_output_ptr + dy_offset + cols * stride_dy_d, mask=mask, other=0.0).to(tl.float32)
+    
+    # Load cached scale (Aviods recomputing sum(x^2))
+    scale = tl.load(scale_ptr + scale_offset).to(tl.float32)
+
+    # Gradient Math: 
+    # dx = scale * dy - (scale^3 * mean(x * dy)) * x
+    
+    # 1. Compute projection (The only reduction needed now)
+    x_dot_dy = tl.sum(x * dy, axis=0)
+    
+    # 2. Compute prefactor
+    prefactor = (scale * scale * scale) * (x_dot_dy / D)
+
+    # 3. Final dx
+    dx = (scale * dy) - (prefactor * x)
+
+    tl.store(grad_input_ptr + dx_offset + cols * stride_dx_d, dx, mask=mask)
+
+class HyperballNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # 1. Setup Shapes for 3D Grid (Batch, Seq, Head) to handle generic inputs
+        # We normalize over the LAST dimension.
+        dim = x.shape[-1]
+        
+        # Flatten arbitrary shapes into (B, S, H) grid logic
+        shape_vec = list(x.shape[:-1])
+        while len(shape_vec) < 3: shape_vec.append(1)
+        B, S, H = shape_vec[0], shape_vec[1], shape_vec[2]
+        
+        # 2. Handle Strides (Insert dummy strides for fake dims)
+        strides = list(x.stride())
+        while len(strides) < 4: strides.insert(-1, 0)
+        sx_b, sx_s, sx_h, sx_d = strides[0], strides[1], strides[2], strides[3]
+
+        # 3. Allocate Outputs
+        y = torch.empty_like(x)
+        
+        # Scale tensor: Shape is input shape without the last dim
+        # e.g., (Batch, Seq, Head)
+        scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
+        
+        # 4. Launch Config
+        BLOCK_SIZE = triton.next_power_of_2(dim)
+        # H100 Optimized Warps
+        num_warps = 4
+        if BLOCK_SIZE >= 2048: num_warps = 8
+        if BLOCK_SIZE >= 4096: num_warps = 16
+        if BLOCK_SIZE >= 8192: num_warps = 32
+
+        grid = (B, S, H)
+        
+        # Scale strides (compact/contiguous usually, but let's be safe)
+        ss = list(scale.stride())
+        while len(ss) < 3: ss.append(0) # Pad if scale is 1D/2D
+        ss_b, ss_s, ss_h = ss[0], ss[1], ss[2]
+
+        hyperball_norm_fwd_kernel[grid](
+            x, y, scale,
+            sx_b, sx_s, sx_h, sx_d,
+            y.stride(0), y.stride(1) if y.ndim>2 else 0, y.stride(2) if y.ndim>3 else 0, y.stride(-1),
+            ss_b, ss_s, ss_h,
+            dim,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps
+        )
+
+        # 5. Save for Backward
+        # Note: Saving 'x' is necessary for the gradient formula.
+        # Saving 'scale' prevents recomputing sum(x^2).
+        ctx.save_for_backward(x, scale)
+        ctx.grid = grid
+        ctx.strides_x = (sx_b, sx_s, sx_h, sx_d)
+        ctx.strides_scale = (ss_b, ss_s, ss_h)
+        ctx.BLOCK_SIZE = BLOCK_SIZE
+        ctx.num_warps = num_warps
+        
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, scale = ctx.saved_tensors
+        B, S, H = ctx.grid
+        sx_b, sx_s, sx_h, sx_d = ctx.strides_x
+        ss_b, ss_s, ss_h = ctx.strides_scale
+        
+        grad_input = torch.empty_like(x)
+        
+        # Handle grad_output strides
+        sdy = list(grad_output.stride())
+        while len(sdy) < 4: sdy.insert(-1, 0)
+        sdy_b, sdy_s, sdy_h, sdy_d = sdy[0], sdy[1], sdy[2], sdy[3]
+        
+        sdx = list(grad_input.stride())
+        while len(sdx) < 4: sdx.insert(-1, 0)
+        sdx_b, sdx_s, sdx_h, sdx_d = sdx[0], sdx[1], sdx[2], sdx[3]
+
+        hyperball_norm_bwd_kernel[ctx.grid](
+            grad_input, grad_output, x, scale,
+            sdx_b, sdx_s, sdx_h, sdx_d,
+            sdy_b, sdy_s, sdy_h, sdy_d,
+            sx_b, sx_s, sx_h, sx_d,
+            ss_b, ss_s, ss_h,
+            x.shape[-1],
+            BLOCK_SIZE=ctx.BLOCK_SIZE,
+            num_warps=ctx.num_warps
+        )
+        
+        return grad_input
+
+def norm(x: torch.Tensor):
+    return HyperballNorm.apply(x)
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
