@@ -913,6 +913,11 @@ class DistAdam(torch.optim.Optimizer):
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
+def hyperball_norm(x: Tensor):
+		vector_norm = x.norm(p=2, dim=-1, keepdim=True)
+		scale = torch.rsqrt(1 + (vector_norm / math.sqrt(x.size(-1))).pow(2))
+		return x * scale
+
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
@@ -1084,7 +1089,8 @@ class CausalSelfAttention(nn.Module):
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
 
         q, k, v = F.linear(x, sa_lambdas[0] * self.qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        # q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = hyperball_norm(q), hyperball_norm(k) # QK norm @Grad62304977
         q, k = yarn.rotary(q), yarn.rotary(k)
         if key_offset:
             # shift keys forward for the stationary head dims. Enables 1-layer induction.
