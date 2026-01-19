@@ -914,8 +914,12 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 def hyperball_norm(x: Tensor):
-		vector_norm = x.norm(p=2, dim=-1, keepdim=True)
-		scale = torch.rsqrt(1 + (vector_norm / math.sqrt(x.size(-1))).pow(2))
+		# vector_norm = x.norm(p=2, dim=-1, keepdim=True)
+		# scale = torch.rsqrt(1 + (vector_norm / math.sqrt(x.size(-1))).pow(2))
+		# vector_norm / math.sqrt(x.size(-1)) cancel the sqrt out and just being mean
+
+		scale = (1 + x.pow(2).mean(dim=-1, keepdim=True)).rsqrt()
+
 		return x * scale
 
 class CastedLinear(nn.Linear):
