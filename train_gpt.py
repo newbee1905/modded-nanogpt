@@ -937,6 +937,9 @@ def _hyperball_norm_kernel(
     tl.store(y_start_ptr + offsets, y, mask=mask)
 
 def norm(x: torch.Tensor):
+    if not x.is_contiguous():
+        x = x.contiguous()
+
     input_shape = x.shape
     x_flat = x.view(-1, input_shape[-1])
     n_rows, n_cols = x_flat.shape

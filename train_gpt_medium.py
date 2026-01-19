@@ -836,8 +836,51 @@ class DistAdam(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
+@triton.jit
+def _hyperball_norm_kernel(
+    X_ptr, Y_ptr,
+    stride_row,
+    D,
+    BLOCK_SIZE: tl.constexpr
+):
+    row_idx = tl.program_id(0)
+    row_start_ptr = X_ptr + row_idx * stride_row
+    
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < D
+    
+    x = tl.load(row_start_ptr + offsets, mask=mask, other=0.0)
+    x_f32 = x.to(tl.float32)
+    
+    sq = x_f32 * x_f32
+    sum_sq = tl.sum(sq, axis=0)
+    mean_sq = sum_sq / D
+    
+    scale = tl.rsqrt(1.0 + mean_sq)
+    
+    y = x_f32 * scale
+    y_start_ptr = Y_ptr + row_idx * stride_row
+    tl.store(y_start_ptr + offsets, y, mask=mask)
+
+def norm(x: torch.Tensor):
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    input_shape = x.shape
+    x_flat = x.view(-1, input_shape[-1])
+    n_rows, n_cols = x_flat.shape
+    y = torch.empty_like(x_flat)
+    
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    grid = (n_rows,)
+    
+    _hyperball_norm_kernel[grid](
+        x_flat, y,
+        x_flat.stride(0),
+        n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
+    return y.view(input_shape)
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
