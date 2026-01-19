@@ -1846,29 +1846,12 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
-            # losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
-            # loss = losses.sum()
-
-            losses = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                target_seq, 
-                reduction='none'
-            )
-						if mtp_weights is not None:
-							losses = losses * mtp_weights.view(-1)
-
+            losses = FusedSoftcappedCrossEntropy.apply(logits.view(-1, logits.size(-1)), target_seq, mtp_weights)
             loss = losses.sum()
         else:
-            # logits = 23 * torch.sigmoid((logits + 5) / 7.5)
-            # logits_for_loss = logits.float()
-            # loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
-
+            logits = 23 * torch.sigmoid((logits + 5) / 7.5)
             logits_for_loss = logits.float()
-            loss = F.cross_entropy(
-                logits_for_loss.view(-1, logits_for_loss.size(-1)), 
-                target_seq, 
-                reduction="mean"
-            )
+            loss = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="mean")
 
         return loss
 
